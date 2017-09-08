@@ -8,7 +8,7 @@ pth is a Pod Troubleshooting Helper for Kubernetes.
 MIT License
 
 
-# Requrements
+# Requirements
 
 - Commands
   - kubectl
