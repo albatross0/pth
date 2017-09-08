@@ -1,0 +1,301 @@
+#!/bin/bash
+
+NAMESPACE=${NAMESPACE:=default}
+PODNAME=""
+NODENAME=""
+CONTAINER=""
+DEADLINE=${DEADLINE:=0}
+IMAGE=${IMAGE:=albatross0/pth-runc:latest}
+ALL_NAMESPACES=0
+PULLPOLICY="IfNotPresent"
+NO_DELETE=0
+MOUNT_ROOTFS=0
+
+PROGRAM="$0"
+CREATED_PODNAME=""
+
+trap 'delete_pod ${CREATED_PODNAME}' EXIT
+trap 'exit 1' SIGHUP SIGTERM SIGINT
+
+declare -A ARGS
+
+function display_help {
+	echo "$PROGRAM SUBCOMMAND OPTION"
+	echo "  SUBCOMMAND:"
+	echo "    ls|list          list containers"
+	echo "    exec             create and execute debug pod"
+	echo "    dls|debuglist    list debug pods"
+	echo "    cleanup          cleanup debug pods"
+	echo "    -h|--help        display this message"
+	echo "  OPTION:"
+	echo "    -n <namespace>          kubernetes namespace (default: $NAMESPACE)"
+	echo "    --all|--all-namespaces  all namespaces"
+	echo "    -p <name>               target pod name"
+	echo "    -c <name>               targe container name"
+	echo "    -deadline <num>         activeDeadlineSeconds of debug pod (default: $DEADLINE)"
+	echo "    -image <name>           image name of debug pod (default: $IMAGE)"
+	echo "    --pull                  set imagePullPolity to Always"
+	echo "    --rootfs                mount node rootfs to debug pod (use this if your container has volumeMounts)"
+	echo "    --no-delete             don't delete debug pod"
+}
+
+function list_containers {
+	if [[ $ALL_NAMESPACES -eq 1 ]] ;then
+		json=$(kubectl get pod --all-namespaces -o json)
+	else
+		json=$(kubectl -n ${NAMESPACE} get pod -o json)
+	fi
+	(echo "NAMESPACE POD CONTAINER PHASE"; echo "$json" | jq -r  '.items[] | "\(.metadata.namespace) \(.metadata.name) \(.status.containerStatuses[].name) \(.status.phase)"') | column -t
+}
+
+function list_debug_pods {
+	if [[ $ALL_NAMESPACES -eq 1 ]] ;then
+		json=$(kubectl get pod -a --all-namespaces -l pth-target -o json)
+	else
+		json=$(kubectl -n ${NAMESPACE} get pod -a -l pth-target -o json)
+	fi
+
+	if [[ $(echo "$json" | jq '.items | length') -eq 0 ]]; then
+		echo "No debug pods"
+		exit
+	fi
+
+	(echo "NAMESPACE POD PHASE"; echo "$json" | jq -r  '.items[] | select(.metadata.name | test("^pth-")) | "\(.metadata.namespace) \(.metadata.name) \(.status.phase)"') | column -t
+}
+
+function generate_pod_yaml {
+	local target_podname="$1"
+	local target_nodename="$2"
+
+	if [[ ${DEADLINE} -gt 0 ]] ;then
+		deadline_definition="activeDeadlineSeconds: ${DEADLINE}"
+	fi
+
+	if [[ $MOUNT_ROOTFS -eq 1 ]]; then
+		rootfs_volumemount="
+    - mountPath: /tmp/pth/node_root
+      name: node-root"
+		rootfs_volume="
+  - hostPath:
+     path: /
+    name: node-root"
+	fi
+
+	POD_YAML=$(cat <<__EOT__
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    pth-target: ${target_podname}
+  name: pth-${target_podname}
+  namespace: ${NAMESPACE}
+spec:
+  $deadline_definition
+  containers:
+  - args:
+    - /pause
+    image: ${IMAGE}
+    imagePullPolicy: ${PULLPOLICY}
+    name: pth
+    securityContext:
+      privileged: true
+    stdin: true
+    stdinOnce: true
+    tty: true
+    volumeMounts:
+    - mountPath: /var/run/docker.sock
+      name: docker-socket
+    - mountPath: /var/lib/docker
+      name: var-lib-docker
+      readOnly: true
+    - mountPath: /var/lib/kubelet
+      name: var-lib-kubelet
+      readOnly: true
+$rootfs_volumemount
+  dnsPolicy: ClusterFirst
+  hostIPC: true
+  hostNetwork: true
+  hostPID: true
+  nodeName: ${target_nodename}
+  restartPolicy: Never
+  volumes:
+  - hostPath:
+      path: /var/run/docker.sock
+    name: docker-socket
+  - hostPath:
+      path: /var/lib/docker
+    name: var-lib-docker
+  - hostPath:
+      path: /var/lib/kubelet
+    name: var-lib-kubelet
+$rootfs_volume
+__EOT__
+	)
+
+	echo "$POD_YAML"
+}
+
+function create_pod {
+	kubectl create -f -
+}
+
+function delete_pod {
+	local delete_target="$1"
+
+	[[ $NO_DELETE -eq 1 ]] && return
+	[[ -z "$delete_target" ]] && return
+
+	kubectl -n ${NAMESPACE} delete pod ${delete_target}
+	exit
+}
+
+function get_target_container {
+	local target_pod="$1"
+
+	json=$(kubectl -n ${NAMESPACE} get pod ${target_pod} -o json)
+	container=$(echo "$json" | jq -r .spec.containers[0].name)
+	if [[ $(echo "$json" | jq '.spec.containers | length') -gt 1 ]]; then
+		>&2 echo "Defaulting container name to ${container}."
+	fi
+   	echo ${container}
+}
+
+function get_target_containerid {
+	local pod_name="$1"
+	local container_name="$2"
+
+	json=$(kubectl -n ${NAMESPACE} get pod ${pod_name} -o json)
+
+	id=$(echo "$json" | jq -r ".status.containerStatuses[] | select(.name == \"$container_name\") | .containerID")
+	echo ${id##docker://}
+}
+
+function exec_pth {
+	if [[ -z "$CONTAINER" ]]; then
+		CONTAINER=$(get_target_container ${PODNAME})
+	else
+		CONTAINER=$(kubectl -n ${NAMESPACE} get pod ${PODNAME} -o json | jq -r ".spec.containers[] | select(.name == \"$CONTAINER\") .name")
+	fi
+	NODENAME=$(kubectl -n ${NAMESPACE} get pod ${PODNAME} -o json | jq -r '.spec.nodeName')
+
+	[[ -z "$CONTAINER" ]] && >&2 echo "container not found" && exit
+
+	generate_pod_yaml "$PODNAME" "$NODENAME" | create_pod || exit
+	CREATED_PODNAME="pth-${PODNAME}"
+
+	echo "waiting for debug pod..."
+	while read -r status
+	do
+		phase=$(echo "$status" | jq -r '.phase')
+
+		case "$phase" in
+			Running) break;;
+			Failed) >&2 echo "Failed to create pod" ; exit 1;;
+			*)
+				waiting=$(echo "$status" | jq '.containerStatuses[0].state.waiting')
+				if [[ "$waiting" != "null" ]]; then
+					[[ $(echo "$waiting" | jq -r '.message') == "null" ]] && continue
+					echo "$waiting" | jq -r '"\(.reason): \(.message)"'
+				fi
+				;;
+		esac
+	done < <(kubectl -n ${NAMESPACE} get pod -l pth-target=${PODNAME} -w -o json | jq --compact-output --unbuffered .status)
+
+	container_id=$(get_target_containerid ${PODNAME} ${CONTAINER})
+
+	kubectl exec -n ${NAMESPACE} -ti ${CREATED_PODNAME} -c pth -- /pth-runc.sh ${container_id} pth-${PODNAME}
+}
+
+function cleanup {
+	list_debug_pods
+	echo -ne "\nAbove pods will be deleted. Are you sure ? (y|n): "
+	read answer
+
+	if [[ ${answer} == "y" ]]; then
+		while read line
+		do
+			set -- $line
+			ns="$1"
+			pod="$2"
+			kubectl -n ${ns} delete pod ${pod}
+		done < <(echo "$json" | jq -r  '.items[] | select(.metadata.name | test("^pth-")) | "\(.metadata.namespace) \(.metadata.name)"')
+	else
+		echo "Cancelled."
+	fi
+}
+
+
+set -e
+hash kubectl
+hash jq
+hash column
+set +e
+
+for ((i=0; $# > 0; i++))
+do 
+	case "$1" in
+		-n)
+			shift
+			NAMESPACE="$1"
+			shift; continue ;;
+		-p)
+			shift
+			PODNAME="$1"
+			shift; continue ;;
+		-c)
+			shift
+			CONTAINER="$1"
+			shift; continue ;;
+		-image)
+			shift
+			IMAGE="$1"
+			shift; continue ;;
+		-deadline)
+			shift
+			DEADLINE="$1"
+			shift; continue ;;
+		--pull)
+			PULLPOLICY=Always
+			shift; continue ;;
+		--no-delete)
+			NO_DELETE=1
+			shift; continue ;;
+		--rootfs)
+			MOUNT_ROOTFS=1
+			shift; continue ;;
+		--all-namespaces|--all)
+			ALL_NAMESPACES=1
+			shift; continue ;;
+		-h|--help)
+			display_help
+			exit;;
+	esac
+
+	ARGS[$i]="$1"
+	shift
+done
+
+set -- ${ARGS[@]}
+case "$1" in
+	ls|list)
+		list_containers
+		;;
+	exec)
+		shift
+		if [[ -z "$PODNAME" ]]; then
+			PODNAME="$1"
+			shift
+		fi
+		exec_pth
+		;;
+	dls|debuglist)
+		list_debug_pods
+		;;
+	cleanup)
+		cleanup
+		;;
+	*)
+		display_help
+		;;
+esac
+
