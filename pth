@@ -187,10 +187,11 @@ function exec_pth {
 	while read -r status
 	do
 		phase=$(echo "$status" | jq -r '.phase')
+		reason=$(echo "$status" | jq -r '.reason')
 
 		case "$phase" in
 			Running) break;;
-			Failed) >&2 echo "Failed to create pod" ; exit 1;;
+			Failed) >&2 echo "Failed to create pod: ${reason}" ; exit 1;;
 			*)
 				waiting=$(echo "$status" | jq '.containerStatuses[0].state.waiting')
 				if [[ "$waiting" != "null" ]]; then
