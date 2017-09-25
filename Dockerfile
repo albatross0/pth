@@ -2,6 +2,7 @@ FROM centos:7.3.1611
 MAINTAINER albatross0@gmail.com
 
 ADD pth-runc.sh /
+ADD .vimrc /root/
 ADD https://github.com/opencontainers/runc/releases/download/v1.0.0-rc4/runc.amd64 /usr/bin/runc
 ADD https://github.com/stedolan/jq/releases/download/jq-1.5/jq-linux64 /usr/bin/jq
 RUN chmod +x /usr/bin/runc /usr/bin/jq
