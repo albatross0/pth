@@ -163,6 +163,16 @@ function set_environ {
 	echo "$config" > ${basedir}/config.json
 }
 
+function set_readonlypaths {
+	config=$(cat ${basedir}/config.json | jq '.linux.readonlyPaths |= .- ["/proc/sys"]')
+	for dir in /proc/sys/*
+	do
+		[[ "$dir" == "/proc/sys/vm" ]] && continue
+		config=$(echo "$config" | jq ".linux.readonlyPaths |= .+ [\"$dir\"]")
+	done
+	echo "$config" > ${basedir}/config.json
+}
+
 function set_args {
 	args=$(cat <<__EOT__
 [
@@ -190,6 +200,7 @@ rm -f /tmp/config.json
 set_capabilities "$response"
 set_namespace "$response"
 set_environ "$response"
+set_readonlypaths
 set_args
 
 runc run -b ${basedir} pth-${CONTAINER_ID}
