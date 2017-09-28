@@ -107,7 +107,7 @@ function set_capabilities {
 	local json="$1"
 
 	capabilities="{}"
-	cap=$(cat ${basedir}/config.json | jq '.process.capabilities.bounding + ["CAP_SYS_ADMIN", "CAP_NET_ADMIN", "CAP_NET_RAW", "CAP_SETGID", "CAP_SETUID", "CAP_SYS_PTRACE", "CAP_SYS_CHROOT", "CAP_MKNOD", "CAP_DAC_READ_SEARCH"]')
+	cap=$(cat ${basedir}/config.json | jq '.process.capabilities.bounding + ["CAP_SYS_ADMIN", "CAP_NET_ADMIN", "CAP_NET_RAW", "CAP_SETGID", "CAP_SETUID", "CAP_SYS_PTRACE", "CAP_SYS_CHROOT", "CAP_MKNOD", "CAP_DAC_OVERRIDE", "CAP_CHOWN", "CAP_FOWNER"]')
 
 	for key in $(cat ${basedir}/config.json | jq -r '.process.capabilities | keys[]')
 	do
